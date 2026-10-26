@@ -1,3 +1,24 @@
+# =====================================================================================
+# FILE MAP -- tests/kernel/test_index.py   (a script; needs a CUDA GPU)
+# =====================================================================================
+# WHAT THIS FILE TESTS: the custom row-lookup kernel `indexing` (kernel/index.py, csrc/jit/index.cu)
+#                       against PyTorch's F.embedding, for correctness and for speed.
+#
+# ELI5: Two exams. Exam 1: look up random rows of a [131,072 x 4,096] half-precision table with
+#       batch sizes 1, 2, 4, ... 32,768; the answers must be bit-identical to PyTorch's, and a
+#       timing table is printed (effective GB/s for each). Exam 2: the same, but pretending to be
+#       one of 4 tensor-parallel GPUs that owns only rows [32,768, 65,536): ids outside that window
+#       must give rows of zeros.
+#
+# ref_indexing is the slow, obvious reference: shift the ids by `start`, remember which fall
+#       outside [0, length), look those up as row 0 (so F.embedding doesn't crash), then zero them.
+#
+# GOTCHA: in test_indexing_with_mask the TIMING block calls indexing(weights, indices) WITHOUT
+#       vocab_range (for both sides), so it times the plain path; only the correctness check
+#       above it exercises the masked kernel. Looks like a copy-paste.
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 from typing import Tuple
 import torch

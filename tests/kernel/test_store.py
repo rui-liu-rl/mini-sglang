@@ -1,3 +1,22 @@
+# =====================================================================================
+# FILE MAP -- tests/kernel/test_store.py   (a script; needs a CUDA GPU)
+# =====================================================================================
+# WHAT THIS FILE TESTS: the K/V write kernel `store_cache` (kernel/store.py, csrc/jit/store.cu)
+#                       against the plain PyTorch way (k_cache[indices] = k), for correctness and speed.
+#
+# ELI5: Make a pretend pantry of 1,048,576 slots, each holding 128 half-precision numbers for K and
+#       128 for V. For batch sizes 1, 2, 4, ... 32,768: pick that many DISTINCT random slots (the
+#       kernel gives no guarantee for duplicate slots), write random K and V rows there with the
+#       custom kernel, and check the shelf holds exactly those rows. Then time it against the
+#       PyTorch version (compiled with torch.compile) and print effective GB/s.
+#
+# WHY THE SETUP IS SLIGHTLY AWKWARD ON PURPOSE: K and V are slices of ONE interleaved tensor
+#       (kv_cache[:, 0, :] and [:, 1, :]), so a cache row is 256 elements apart, and the inputs k, v
+#       are slices of a wider qkv tensor (512 elements apart). The kernel must handle both row
+#       strides, as it does when fed real model output. Bytes moved = bs x 128 x 2 (K and V) x 2.
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 from minisgl.benchmark.perf import compare_memory_kernel_perf

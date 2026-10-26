@@ -1,3 +1,34 @@
+# =====================================================================================
+# FILE MAP -- benchmark/client.py
+# =====================================================================================
+# WHAT THIS FILE IS: the shared machinery of mini-sglang's online benchmarks: a load generator that
+#                    sends many chat requests to a running server through the OpenAI-style API,
+#                    records WHEN each streamed chunk arrives, and turns those timestamps into
+#                    the numbers from Part I chapter 5 (TTFT, TPOT, end-to-end time, throughput).
+#
+# ELI5: Picture a crowd of pretend customers. Each walks up to the front desk, orders, and then
+#       stands with a stopwatch, writing down the clock time at which every spoonful of the answer
+#       arrives. At the end we read the stopwatches:
+#
+#           tics = [t_start, t_first_chunk, t_2nd_chunk, ..., t_last_chunk]
+#           TTFT  = t_first_chunk - t_start                 (time to first token)
+#           TPOT  = each gap between consecutive chunks      (time per output token / ITL)
+#           E2E   = t_last - t_start                         (whole answer)
+#           throughput = tokens / (latest time - earliest time over ALL requests)
+#
+# THE PIECES
+#       BenchmarkTrace      one planned request: when to send it, the text, the lengths
+#       benchmark_one       send ONE request, stream the reply, return the timestamps
+#       benchmark_one_batch send many at once (all together)
+#       benchmark_trace     send many at their recorded times (replaying a real workload trace)
+#       process_benchmark_results   timestamps -> printed statistics
+#       read_qwen_trace / read_mooncake_trace   load two public trace file formats
+#       Console / make_console      progress bars and in-flight counters
+#
+# WHO USES IT: benchmark/online/*.py, benchmark/offline/*.py (top-level benchmark folder).
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 import asyncio
@@ -15,6 +46,8 @@ from tqdm.asyncio import tqdm
 logger = init_logger(__name__)
 
 
+# ELI5: one line of a workload plan: "at second T, send this text, and expect about this many
+#       answer tokens". input_length is optional and used to force a prompt length.
 @dataclass(frozen=True)
 class BenchmarkTrace:
     timestamp: float  # unit (second)
@@ -23,6 +56,9 @@ class BenchmarkTrace:
     input_length: int | None = None  # input length in tokens, optional
 
 
+# ELI5: one request's stopwatch readings, saved in a compact form.
+# FORMAT (as_json): [input_len, output_len, tic0, tic1, tic2, ...], times already shifted so the
+#       earliest request starts at 0. from_json reads it back (checks the two lengths are whole numbers).
 @dataclass(frozen=True)
 class BenchOneResult:
     tics: List[float]
@@ -39,6 +75,8 @@ class BenchOneResult:
         return BenchOneResult(tics=raw[2:], input_len=int(raw[0]), output_len=int(raw[1]))
 
 
+# WHAT: the raw output of benchmark_one: the prompt text, the lengths, and the timestamps
+#       (time.perf_counter() readings, in seconds, from an arbitrary starting point).
 @dataclass(frozen=True)
 class RawResult:
     input_len: int | None
@@ -47,6 +85,7 @@ class RawResult:
     tics: List[float]
 
 
+# WHAT: a counter that remembers its highest value ever (used for "max requests in flight").
 @dataclass
 class Counter:
     current: int = 0
@@ -61,6 +100,12 @@ class Counter:
         assert self.current >= 0
 
 
+# ELI5: the scoreboard: four progress bars plus two live counters.
+#   input_pbar    requests sent                 output_pbar   requests finished
+#   prefill_pbar  requests that got their FIRST chunk (the prompt has been processed)
+#   decode_pbar   chunks received after the first (decode steps)
+#   inflight_counter  sent but not yet finished;  queue_counter  sent but no first chunk yet
+#   (so queue_counter approximates "requests waiting for prefill")
 @dataclass
 class Console:
     input_pbar: tqdm
@@ -109,6 +154,8 @@ class Console:
             logger.info(f"Max inflight requests: {max_inflight}, Max queued requests: {max_queue}")
 
 
+# WHAT: all requests' readings together; as_json / from_json turn it into plain lists so a
+#       benchmark run can be saved to a file and analysed later.
 @dataclass(frozen=True)
 class BenchmarkResult:
     raw_data: List[BenchOneResult]
@@ -121,6 +168,9 @@ class BenchmarkResult:
         return BenchmarkResult(raw_data=[BenchOneResult.from_json(r) for r in raw])
 
 
+# WHAT: build the scoreboard. The prefill bar counts requests (one first chunk per request); the
+#       decode bar counts the remaining chunks: sum of output lengths minus one per request.
+#       The string juggling with n_fmt just widens the number column so the bars line up.
 def make_console(num_requests: int, sum_output_length: int, use_pbar: bool = True) -> Console:
     BAR_FORMAT_0 = (
         "{desc:<10} {percentage:3.0f}%|{bar}|"
@@ -180,6 +230,11 @@ def make_console(num_requests: int, sum_output_length: int, use_pbar: bool = Tru
     )
 
 
+# ELI5: "Invent a prompt that is exactly n tokens long." Pick n random token ids from the lower half
+#       of the vocabulary, turn them into text, then re-tokenise that text; text and tokens do not
+#       always round-trip, so if the count is off, top up with more random ids or cut, and try again
+#       (up to 64 times, then give up). Random words mean there is NO shared prefix between prompts,
+#       so the prefix cache cannot help: a harsh test.
 def generate_prompt(tokenizer: Any, n: int) -> str:
     """Generate a prompt of approximately `n` tokens using the provided tokenizer."""
     vocab_size = tokenizer.vocab_size // 2
@@ -199,6 +254,21 @@ def generate_prompt(tokenizer: Any, n: int) -> str:
     raise ValueError("Failed to generate a message of the desired length.")
 
 
+# ELI5: ONE pretend customer. Sends the prompt, then writes down the clock each time a streamed
+#       chunk arrives.
+# WHAT (in order):
+#   1. request settings: ignore_eos=True (always produce exactly output_length tokens, so every run
+#      does the same amount of work), top_k=1 and temperature 0.0 (deterministic greedy).
+#      `input_length_override` is an internal extra field "that might work for our system"; the
+#      server's request form ignores unknown fields, so today it has no effect on mini-sglang.
+#   2. send with stream=True. tics[0] is the clock right after the call returns, tics[1] the first
+#      chunk, and so on.
+#   3. progress bookkeeping: the first chunk marks "prefill done"; later chunks are decode steps.
+# GOTCHA (my reading): with the OpenAI client, create(stream=True) returns once the response
+#      HEADERS arrive, which the server sends before the first token, so "TTFT" here is measured
+#      from that moment, not from the instant the request was written to the socket.
+# GOTCHA: every chunk is counted, including the server's closing chunk (finish_reason "stop"), so
+#      a request with output_length N produces about N + 2 tics.
 async def benchmark_one(
     client: OpenAI,
     prompt: str,
@@ -248,6 +318,8 @@ async def benchmark_one(
         )
 
 
+# ELI5: send ALL the prompts at the same moment (asyncio.gather) and wait for everyone. This is
+#       the "burst" workload: the server sees a wall of requests at once.
 async def benchmark_one_batch(
     client: OpenAI,
     prompts: List[str],
@@ -284,6 +356,9 @@ async def benchmark_one_batch(
         return await asyncio.gather(*tasks)
 
 
+# ELI5: replay a recorded workload. Each request sleeps until its own send time, then goes. The
+#       earliest timestamp minus 1 second is the zero point, so the first request is sent about
+#       1 second after the start, and the recorded spacing between arrivals is reproduced.
 async def benchmark_trace(
     client: OpenAI,
     msgs: List[BenchmarkTrace],
@@ -309,6 +384,21 @@ async def benchmark_trace(
         return await asyncio.gather(*tasks)
 
 
+# ELI5: read the stopwatches. Given every request's tics, print and (if a tokenizer is supplied)
+#       return the results. The two @overload lines only tell type checkers: with a tokenizer you
+#       get a BenchmarkResult back, without one you get None.
+# WHAT it computes (timestamps in seconds; TTFT and TPOT are printed in milliseconds):
+#       first_times  each request's first gap (tics[1] - tics[0])           -> TTFT
+#       accum_times  all later gaps of all requests, pooled                  -> TPOT / ITL
+#       e2e_times    last tic minus first tic per request                    -> end to end (seconds)
+#       For each list: average and the p50 / p90 / p99 / max, using plain index picking
+#       (sorted_list[int(len * q)], no interpolation; with fewer than 100 samples p99 is simply
+#       near the maximum).
+#       Duration = latest tic over all requests minus earliest; throughput = tics / duration.
+# GOTCHA: "tokens" in the throughput line are the number of tics, which includes each request's
+#       start tic and the closing chunk (about 2 extra per request).
+# GOTCHA: the closing chunk arrives immediately after the last token, so it adds one near-zero gap
+#       per request to the TPOT pool, nudging TPOT slightly down (about 1/N for N output tokens).
 @overload
 def process_benchmark_results(raw_data: List[RawResult], tokenizer: Any) -> BenchmarkResult: ...
 
@@ -404,6 +494,11 @@ def process_benchmark_results(
     )
 
 
+# ELI5: load a trace file in the Qwen format: one JSON object per line with chat_id, parent_chat_id,
+#       timestamp (seconds), input_length, output_length (the rest is unused here).
+#       dummy=True: make ONE long random prompt and cut every request's prompt from its beginning
+#       (so prompts share prefixes, favouring a prefix cache); dummy=False: a fresh random
+#       prompt of the right length for each line (no sharing). `n` keeps only the first n lines.
 def read_qwen_trace(
     file_path: str,
     tokenizer: Any,
@@ -442,6 +537,8 @@ def read_qwen_trace(
     ]
 
 
+# ELI5: the same for the Mooncake trace format (timestamps in MILLISECONDS, divided by 1000 here;
+#       fields timestamp, input_length, output_length, hash_ids).
 def read_mooncake_trace(
     file_path: str,
     tokenizer: Any,
@@ -476,6 +573,8 @@ def read_mooncake_trace(
     ]
 
 
+# ELI5: speed the replay up or down. Shift times so the first request is at 0, multiply by `scale`
+#       (0.5 = twice as fast, 2.0 = half the request rate), and sort by time.
 def scale_traces(
     traces: List[BenchmarkTrace],
     scale: float,
@@ -495,6 +594,7 @@ def scale_traces(
     )
 
 
+# WHAT: ask the server which model it serves (GET /v1/models) and return the first id.
 async def get_model_name(client: OpenAI) -> str:
     async for model in client.models.list():
         return model.id

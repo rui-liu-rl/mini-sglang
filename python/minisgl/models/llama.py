@@ -1,3 +1,10 @@
+# FILE MAP -- models/llama.py
+# WHAT: the Llama recipe (Llama-2/3 family). Identical building blocks to qwen3.py (read that
+#       file's comments first). Differences: plain attention (no QK-norm, no bias); the RoPE
+#       length-extension variant for Llama-3.1 ("llama3" rope_scaling) is handled in
+#       layers/rotary.py, not here.
+# ELI5: the original building plan that the others copied and tweaked.
+# Tag legend: see zero-to-sglang/eli5/README.md
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
@@ -15,6 +22,7 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 
+# ELI5: ONE FLOOR (same five lines as Qwen3's).
 class LlamaDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self.self_attn = LlamaAttn(config, layer_id)
@@ -43,6 +51,7 @@ class LlamaDecoderLayer(BaseOP):
         return x, residual
 
 
+# ELI5: THE BUILDING (embed -> floors -> final norm).
 class LlamaModel(BaseOP):
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(
@@ -65,6 +74,7 @@ class LlamaModel(BaseOP):
         return self.norm.forward(x, residual)[0]
 
 
+# ELI5: THE BUILDING WITH THE SCOREBOARD ON TOP.
 class LlamaForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = LlamaModel(config)

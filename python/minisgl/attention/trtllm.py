@@ -1,3 +1,25 @@
+# =====================================================================================
+# FILE MAP -- attention/trtllm.py   (the "trtllm" backend = TensorRT-LLM kernels via FlashInfer)
+# =====================================================================================
+# WHAT THIS FILE IS: the attention backend that calls NVIDIA's TensorRT-LLM attention kernels
+#                    (exposed through the FlashInfer package). It is the auto-selected backend on
+#                    Blackwell (SM100) GPUs.
+#
+# ELI5: the third interchangeable tool in the attention toolbox. Structurally it is a twin of
+#       attention/fa.py: the same metadata (cu_seqlens, cache_seqlens, a PAGE table), the same
+#       "store K/V then attend" forward, the same CUDA-graph buffers. The difference is which
+#       kernels run, and that it uses TWO different entry points:
+#           prefill batch -> trtllm_batch_context_with_kv_cache
+#           decode batch  -> trtllm_batch_decode_with_kv_cache
+#
+# CONSTRAINT: supports page sizes 16, 32 or 64 only. engine.py's _adjust_config overrides
+#       --page-size to 64 if you pick this backend with any other value.
+#
+# NOTE ON bmm1_scale / bmm2_scale: the kernel does two batched matmuls (Q K^T, then scores V);
+#       bmm1_scale = 1/sqrt(head_dim) is applied to the first, 1.0 to the second.
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,6 +40,7 @@ class TRTLLMCaptureData(BaseCaptureData):
     pass
 
 
+# ELI5: same paperwork as FAMetadata (see attention/fa.py).
 @dataclass
 class TRTLLMMetadata(BaseAttnMetadata):
     cu_seqlens_k: torch.Tensor
@@ -42,10 +65,13 @@ class TensorRTLLMBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
+        # WHAT: 128 MiB scratch space for the kernels.
         self.workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.kvcache.device
         )
 
+    # ELI5: store the new K/V, then run the prefill or the decode kernel.
+    # SHAPE: q [N, Hq_local, D]; kv_cache = (K, V) each [num_pages, page_size, Hkv_local, D].
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
@@ -88,6 +114,8 @@ class TensorRTLLMBackend(BaseAttnBackend):
                 out_dtype=q.dtype,
             )
 
+    # WHAT: identical to FlashAttentionBackend.prepare_metadata (see attention/fa.py for the
+    #       explanation of cu_seqlens_q's three cases and of the page-table construction).
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
 

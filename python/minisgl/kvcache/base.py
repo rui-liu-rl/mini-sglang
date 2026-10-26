@@ -1,3 +1,27 @@
+# =====================================================================================
+# FILE MAP -- kvcache/base.py
+# =====================================================================================
+# WHAT THIS FILE IS: the job descriptions ("interfaces") of the two big jobs around the KV cache:
+#                      1. BaseKVCachePool : the PANTRY SHELF itself (store and fetch K/V numbers)
+#                      2. BasePrefixCache : the SHARED INDEX of which words already have notes
+#                    plus the small record types they exchange.
+#
+# ELI5: Two different questions, two different objects:
+#       "Where do the actual numbers live and how do I write/read them?"  -> BaseKVCachePool
+#       "Has anyone already written notes for the beginning of this order?" -> BasePrefixCache
+#       The pool knows NUMBERS but not WHO they belong to. The prefix cache knows WHO/WHAT (which
+#       words map to which slots) but never touches the numbers.
+#
+# VOCABULARY
+#   handle (BaseCacheHandle) : a TICKET describing a stored path ("the first 120 words of this
+#                              order are stored, here are their slots"). cached_len = path length.
+#   lock / unlock            : pin the notes behind a ticket so eviction cannot remove them
+#                              (reference counting).
+#   evictable_size           : stored tokens nobody is using; may be thrown out when space is needed
+#   protected_size           : stored tokens some running order is using; untouchable
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -7,18 +31,22 @@ from typing import NamedTuple
 import torch
 
 
+# ELI5: "the pantry shelf". Three actions plus three facts about itself.
 class BaseKVCachePool(ABC):
     """
     Base class for key-value caches.
     This class defines the interface for key-value caches used.
     """
 
+    # SHAPE: returns the layer's Label shelf [num_pages, page_size, kv_heads, head_dim]  (a view)
     @abstractmethod
     def k_cache(self, index: int) -> torch.Tensor: ...
 
+    # SHAPE: same for the Gift shelf.
     @abstractmethod
     def v_cache(self, index: int) -> torch.Tensor: ...
 
+    # WHAT: write k[i], v[i] into slot out_loc[i] of layer `layer_id`, for every new token i.
     @abstractmethod
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
@@ -37,14 +65,18 @@ class BaseKVCachePool(ABC):
     def num_layers(self) -> int: ...
 
 
+# ELI5: a TICKET for a stored path. frozen = cannot be edited; hashable.
 @dataclass(frozen=True)
 class BaseCacheHandle(ABC):
+    # WHAT: how many leading tokens this ticket covers.
     cached_len: int
 
+    # SHAPE: returns the slot numbers of those cached_len tokens, in order [cached_len], int32.
     @abstractmethod
     def get_matched_indices(self) -> torch.Tensor: ...
 
 
+# WHAT: the two counters the clerk (scheduler/cache.py) uses to decide what is available.
 class SizeInfo(NamedTuple):
     evictable_size: int
     protected_size: int
@@ -54,16 +86,20 @@ class SizeInfo(NamedTuple):
         return self.evictable_size + self.protected_size
 
 
+# WHAT: the answer of insert_prefix.
 class InsertResult(NamedTuple):
     cached_len: int  # length already in cache before insertion (should be freed)
     handle: BaseCacheHandle  # cache handle for the inserted prefix
 
 
+# WHAT: the answer of match_prefix. (The "cuda_handle" naming leaves room for a CPU-memory tier
+#       later: "TODO: support HiCache"; see Part III chapter 3.)
 class MatchResult(NamedTuple):
     cuda_handle: BaseCacheHandle
     # TODO: support HiCache
 
 
+# ELI5: "the shared index". Six actions; the radix tree and the naive no-op both implement them.
 class BasePrefixCache(ABC):
     @abstractmethod
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:

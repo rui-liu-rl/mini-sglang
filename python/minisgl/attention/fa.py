@@ -1,3 +1,30 @@
+# =====================================================================================
+# FILE MAP -- attention/fa.py   (the "fa" backend = FlashAttention via sgl_kernel)
+# =====================================================================================
+# WHAT THIS FILE IS: the attention backend built on FlashAttention-3 (FlashAttention-4 on
+#                    Blackwell) through SGLang's `sgl_kernel` package. On Hopper GPUs it is the
+#                    default for PREFILL ("fa,fi").
+#
+# ELI5 -- what FlashAttention is: the textbook way to do attention builds the full N x N score
+# table, writes it to the far warehouse (HBM), reads it back for softmax, writes again ...
+# FlashAttention instead works TILE BY TILE inside the fast on-chip memory, keeping a running
+# softmax, and never writes the big table out. Same answer, far fewer trips to the warehouse
+# (Part I ch.3's lesson, in a kernel).
+#
+# HOW THIS BACKEND FEEDS IT. The kernel `flash_attn_with_kvcache` is given:
+#       q               the new Questions, packed [N, Hq, D]
+#       k_cache/v_cache the layer's whole pantry, [num_pages, page_size, Hkv, D]
+#       page_table      per request, which PAGES hold its K/V   [bs, max_pages]
+#       cache_seqlens   per request, total context length (device_len)
+#       cu_seqlens_q    cumulative new-token counts (the packed-list boundaries)
+#       causal=True     query j of a request sees keys up to its own position
+#
+#     Compared with fi.py: this backend supports real PAGES (page_size > 1): the page table is
+#     built by taking every page_size-th entry of the per-token table and dividing by page_size
+#     (token slot number -> page number).
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,16 +46,19 @@ class FACaptureData(BaseCaptureData):
     pass
 
 
+# ELI5: the paperwork for one batch.
 @dataclass
 class FAMetadata(BaseAttnMetadata):
-    cu_seqlens_k: torch.Tensor
-    cu_seqlens_q: torch.Tensor
-    cache_seqlens: torch.Tensor
+    # SHAPE: all GPU int32 tensors.
+    cu_seqlens_k: torch.Tensor  # [bs + 1] running sum of context lengths
+    cu_seqlens_q: torch.Tensor  # [bs + 1] running sum of new-token counts
+    cache_seqlens: torch.Tensor  # [bs]     context length of each request
     max_seqlen_k: int
     max_seqlen_q: int
 
-    page_table: torch.Tensor
+    page_table: torch.Tensor  # [bs, max_pages]
 
+    # WHAT: row of the LAST token of each request in the packed list = cu_seqlens_q[i+1] - 1.
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
@@ -42,9 +72,13 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.capture: FACaptureData | None = None
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
+        # WHAT: the 1/sqrt(head_dim) scaling of the scores.
         self.scale = config.head_dim**-0.5
+        # WHAT: which FlashAttention generation to call: 4 on Blackwell, else 3 (Hopper).
         self.version = 4 if is_sm100_supported() else 3
 
+    # ELI5: store the new K/V in the pantry, then run the FlashAttention kernel.
+    # SHAPE: q [N, Hq_local, D] -> returns [N, Hq_local, D].
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
@@ -64,6 +98,12 @@ class FlashAttentionBackend(BaseAttnBackend):
             version=self.version,
         )
 
+    # ELI5: build the paperwork. Same logic as fi.py for the lengths; the page table differs.
+    # WHAT: page_table row for request i = its per-token slot list, sampled every page_size
+    #       entries (the first slot of each page) up to the longest context in the batch, then
+    #       divided by page_size to get PAGE numbers. All rows get the same length
+    #       (max_seqlen_k // page_size); entries past a request's real length are ignored because
+    #       cache_seqlens tells the kernel how far to read.
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
 
@@ -104,6 +144,8 @@ class FlashAttentionBackend(BaseAttnBackend):
             page_table=new_page_table,
         )
 
+    # WHAT: allocate the fixed CUDA-graph stage buffers. The page table here is [max_bs, pages],
+    #       so max_seq_len is divided by page_size.
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
@@ -112,6 +154,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.capture = capture
         self.capture_bs = sorted(bs_list)
 
+    # ELI5: the recording is filmed with metadata that are VIEWS of the fixed stage buffers.
     def prepare_for_capture(self, batch: Batch) -> None:
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
@@ -125,6 +168,8 @@ class FlashAttentionBackend(BaseAttnBackend):
         )
         batch.attn_metadata = metadata
 
+    # ELI5: before playing the recording, copy this step's REAL lengths and page lists onto the
+    #       stage. (cu_seqlens_q is untouched: for decode it is always 0,1,2,...,bs.)
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FAMetadata)
@@ -136,6 +181,10 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.capture.page_table[:bs, :table_len].copy_(metadata.page_table)
 
 
+# WHAT: thin wrapper around sgl_kernel's flash_attn_with_kvcache with SGLang's defaults:
+#       window_size (-1, -1) = unlimited context window; softcap 0.0 = off; causal=True.
+#       num_splits / pack_gqa = tuning knobs left at their defaults.
+# GOTCHA: a clear ImportError message is raised if sgl_kernel is missing.
 def _fa_sgl_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,

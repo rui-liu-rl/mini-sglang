@@ -1,3 +1,10 @@
+# FILE MAP -- models/mistral.py
+# WHAT: the Mistral recipe. Identical building blocks to qwen3.py / llama.py (read qwen3.py's
+#       comments first). Also serves "Mistral3ForConditionalGeneration" checkpoints (see
+#       models/register.py): only the TEXT part of those multimodal models is used; the vision
+#       weights are skipped by models/weight.py and the nested text_config is unwrapped by
+#       models/config.py.
+# Tag legend: see zero-to-sglang/eli5/README.md
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
@@ -15,6 +22,7 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 
+# ELI5: ONE FLOOR (same five lines as Qwen3's).
 class MistralDecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self.self_attn = MistralAttn(config, layer_id)
@@ -43,6 +51,7 @@ class MistralDecoderLayer(BaseOP):
         return x, residual
 
 
+# ELI5: THE BUILDING (embed -> floors -> final norm).
 class MistralModel(BaseOP):
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(
@@ -65,6 +74,7 @@ class MistralModel(BaseOP):
         return self.norm.forward(x, residual)[0]
 
 
+# ELI5: THE BUILDING WITH THE SCOREBOARD ON TOP.
 class MistralForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = MistralModel(config)

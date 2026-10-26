@@ -1,3 +1,30 @@
+# =====================================================================================
+# FILE MAP -- benchmark/offline/bench_wildchat.py
+# =====================================================================================
+# WHAT THIS FILE IS: an OFFLINE benchmark on REAL user prompts (from the public WildChat dataset)
+#                    instead of random token ids. Like bench.py it uses the engine as a library.
+#
+# ELI5: Random gibberish prompts are an easy, unrealistic test. Here the customers are real people
+#       asking real questions, so prompt lengths and answer lengths vary naturally, and the model
+#       stops when it wants to (ignore_eos is False).
+#
+# STEPS
+#   1. download the first shard of the dataset (a parquet file) if it is not already next to this script
+#   2. keep each conversation's FIRST user message, only English or Chinese, skipping redacted or
+#      toxic ones and empty ones
+#   3. turn each into token ids with the model's chat template (adds the "assistant starts here" marker)
+#   4. take the first 256 such prompts; each may produce up to 4,096 tokens
+#   5. warm up with one request, then time generate() on all of them
+#   6. print input and output length statistics and the throughput
+#
+# WHAT THE NUMBER MEANS: throughput = ACTUAL output tokens / seconds (unlike bench.py, which assumes
+#       every request produced exactly its maximum). The printed "output budget" shows the maximum
+#       that was allowed, for comparison.
+#
+# NOTE: requests are NOT sorted or shuffled beyond dataset order; temperature 0.6 sampling.
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 import shutil
 import time
 import urllib.request
@@ -16,6 +43,7 @@ WILDCHAT_FIRST_SHARD = "train-00000-of-00086.parquet"
 WILDCHAT_BASE_URL = "https://huggingface.co/datasets/allenai/WildChat-4.8M/resolve/main/data/"
 
 
+# WHAT: fetch a file from the web the first time, skip if it is already on disk.
 def download_if_missing(url: str, path: Path) -> None:
     if path.exists():
         return
@@ -25,6 +53,9 @@ def download_if_missing(url: str, path: Path) -> None:
         shutil.copyfileobj(resp, out)
 
 
+# ELI5: a generator that yields one prompt (as token ids) at a time. It reads the dataset in batches
+#       of 256 conversations, applies the filters from the file map, and tokenises with the chat
+#       template. `yield` hands the ids to the caller and resumes here for the next one.
 def iter_filtered_prompt_ids(tokenizer):
     shard_path = BASE_DIR / WILDCHAT_FIRST_SHARD
     download_if_missing(WILDCHAT_BASE_URL + WILDCHAT_FIRST_SHARD, shard_path)
@@ -65,6 +96,7 @@ def iter_filtered_prompt_ids(tokenizer):
             yield ids
 
 
+# WHAT: print count, min, p50, p90, p99, max of a list of lengths (percentile = sorted index, no interpolation).
 def print_len_stats(name: str, lengths: list[int]) -> None:
     if not lengths:
         print(f"{name}: no data")
@@ -86,6 +118,7 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
 
+    # WHAT: collect the first NUM_SEQS prompts that pass the filters.
     prompt_token_ids = []
     for ids in iter_filtered_prompt_ids(tokenizer):
         prompt_token_ids.append(ids)
@@ -101,6 +134,8 @@ def main() -> None:
     llm = LLM(MODEL)
 
     # warm up
+    # WHAT: one request first (library setup and kernel compilation are paid before timing); also
+    #       prints the templated prompt and the output so you can see the model is sane.
     warmup_result = llm.generate(
         [prompt_token_ids[0]],
         sampling_params[0],

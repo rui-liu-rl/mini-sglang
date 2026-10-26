@@ -1,3 +1,31 @@
+# =====================================================================================
+# FILE MAP -- tests/kernel/test_comm.py   (a script, not pytest; needs 4 GPUs)
+# =====================================================================================
+# WHAT THIS FILE TESTS: mini-sglang's own NCCL wrapper (kernel/pynccl.py + csrc/src/pynccl.cu):
+#                       all_reduce for correctness and speed, and all_gather for correctness.
+#
+# ELI5: Four processes (tp_size = 4), one per GPU, are started. They first form a CPU phone line
+#       (Gloo), use it to hand around the NCCL group ticket (init_pynccl), and then run:
+#
+#         test_correctness(all_reduce)
+#             1. every rank starts with all-ones and all-reduces 4 times: each round multiplies
+#                by 4, so the result must be 4^4 = 256 everywhere
+#             2. every rank starts with its own rank number: the sum must be 0+1+2+3 = 6.
+#                Rank 0 SLEEPS one second first, to prove the others WAIT for it rather than
+#                racing ahead (a barrier-like property of the collective)
+#             3. half zeros, half ones: zeros stay zero, ones become 4 (smaller numbers avoid fp16 overflow)
+#         bench_performance(all_reduce)   time 1024 calls x 16 on a 8192 x 512 half-precision tensor
+#                                         (8 MiB), report microseconds, GB/s and memory use
+#         test_correctness again          (the benchmark must not have broken anything)
+#         all_gather                      rank r contributes K copies of the number r; the result
+#                                         must be [0]*K + [1]*K + [2]*K + [3]*K on every rank
+#
+# KNOBS: USE_SYMM switches the staging buffer on (max_size_bytes > 0) or off (0).
+#        The bandwidth line is bytes / time, a simple yardstick, not NCCL's bus-bandwidth formula.
+#        Run it directly: python tests/kernel/test_comm.py  (it sets MASTER_ADDR/PORT itself).
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 import os
 import time
 import torch

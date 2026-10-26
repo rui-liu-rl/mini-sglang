@@ -1,3 +1,26 @@
+# =====================================================================================
+# FILE MAP -- tests/core/test_scheduler.py   (a script; needs a GPU and the model weights)
+# =====================================================================================
+# WHAT THIS FILE TESTS: the scheduler + engine on their own, with NO HTTP server and NO tokenizer
+#                       process: a hand-made "front desk" talks to the scheduler directly over
+#                       ZeroMQ and checks that it produces a complete answer.
+#
+# ELI5: Hire one head waiter and one chef (a Scheduler process on GPU 0, model Llama-3.1-8B-Instruct,
+#       at most 4 orders at once, CUDA graphs for tray sizes 2, 4, 8). Then play every other
+#       role yourself:
+#         1. tokenise one question with the model's own tokenizer
+#         2. push a UserMsg (uid 0, those token ids, max 100 new tokens) into the scheduler's in-tray
+#         3. read the scheduler's out-tray: each DetokenizeMsg carries ONE new token; append it,
+#            stop when `finished`
+#         4. decode and log the whole text; send ExitMsg so the scheduler shuts down
+#       It is a smoke test: it passes if the loop ends and the logged text is sensible.
+#
+# NOTE: the scheduler runs in its own spawned process and signals readiness through a queue
+#       (queue.put(None) / q.get()). The test's queues use create=False: it dials in to addresses
+#       the scheduler owns.
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 import torch

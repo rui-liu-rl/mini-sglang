@@ -1,3 +1,24 @@
+# =====================================================================================
+# FILE MAP -- benchmark/online/bench_simple.py
+# =====================================================================================
+# WHAT THIS FILE IS: the simplest ONLINE benchmark: send a burst of requests (all at once) to a
+#                    RUNNING mini-sglang server and print TTFT / TPOT / throughput.
+#
+# ELI5: Sixty-four customers walk in at the same moment, each with a prompt of random length (1 to
+#       8,192 words) asking for a random number of answer tokens (16 to 1,024). We time everyone.
+#
+# STEPS
+#   1. connect to the server at 127.0.0.1:1919 and ask which model it serves; load that tokenizer
+#   2. in the background, build 64 random prompts (random length, random token ids); meanwhile
+#      send a tiny connection test (a 100-token prompt, 2 output tokens). If fewer than three
+#      timestamps come back, report failure and stop
+#   3. send all 64 at once with benchmark_one_batch and print the statistics
+#
+# Because every prompt is random, there is no shared prefix: the prefix cache cannot help here.
+# Statistics code: benchmark/client.py (process_benchmark_results). Random seed 42.
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 import asyncio
 import random
 import sys
@@ -21,6 +42,8 @@ async def main():
     try:
         random.seed(42)  # reproducibility
 
+        # WHAT: build `max_bs` random prompts; `await asyncio.sleep(0)` after each lets other tasks
+        #       (the connection test) run while the prompts are being generated.
         async def generate_task(max_bs: int) -> List[str]:
             """Generate a list of tasks with random lengths."""
             result = []

@@ -1,3 +1,26 @@
+// =====================================================================================
+// FILE MAP -- kernel/csrc/jit/store.cu
+// =====================================================================================
+// WHAT THIS FILE IS: the GPU program behind kernel/store.py: write this step's new K and V rows
+//                    into the pantry (KV cache) slots chosen by the scheduler.
+//
+//     for each new word i:     k_cache[ indices[i], :] = k[i, :]
+//                              v_cache[ indices[i], :] = v[i, :]
+//
+// ELI5: after the attention layer works out the Labels (K) and Gifts (V) of the new words, they
+//       have to be shelved. One GPU WARP (32 threads) takes one word, copies its K row and then
+//       its V row to the slot number written in `indices`. All words are handled in parallel.
+//
+// STRIDES: the cache rows and the input rows need not sit right next to each other, so the kernel
+//       gets two row strides (in bytes): kv_cache_stride (distance between consecutive slots) and
+//       kv_input_stride (distance between consecutive input words).
+//
+// Example (Qwen3-0.6B, bf16, 8 KV heads of 128): element_size = 8 x 128 x 2 = 2048 bytes per row;
+//       10 new words -> 10 warps -> 3 blocks of 4 warps (128 threads); each warp does 4 rounds of
+//       16-byte handfuls for K and 4 for V.
+//
+// Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+// =====================================================================================
 #include <minisgl/tensor.h>
 #include <minisgl/utils.cuh>
 #include <minisgl/utils.h>
@@ -11,6 +34,7 @@
 
 namespace {
 
+// WHAT: the arguments of the kernel, passed as one struct.
 struct StoreKernelParams {
   void *__restrict__ k_cache;
   void *__restrict__ v_cache;
@@ -22,6 +46,7 @@ struct StoreKernelParams {
   std::size_t length;
 };
 
+// ELI5: one warp = one word. "Which slot (pos) is mine? copy my K row there, then my V row."
 template <std::size_t kNumThreads, std::size_t kMaxOccupancy, bool kUsePDL,
           std::size_t kElementSize, std::integral T>
 __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
@@ -52,6 +77,8 @@ __global__ __launch_bounds__(kNumThreads, kMaxOccupancy) void //
   PDL::launch<kUsePDL>();
 }
 
+// ELI5: the host-side launcher. Python calls StoreKernel<...>::run(k_cache, v_cache, indices, k, v).
+//       It checks the tensors, computes the two strides, and launches one warp per new word.
 template <std::size_t element_size, // depends on data type and embedding dim
           std::size_t num_threads = 128,   // number of threads per block
           std::size_t max_concurrency = 1, // max blocks per SM
@@ -70,6 +97,9 @@ struct StoreKernel {
     auto dtype_ = SymbolicDType{};
     auto device_ = SymbolicDevice{};
 
+    // WHAT: the cache tensors: [any number of slots, D] with last-dimension stride 1 and any row
+    //       stride X; the inputs: [L, D] with row stride Y; the indices: [L] int32/int64.
+    //       All on the same CUDA device, K/V in the same dtype.
     TensorMatcher({-1, D}) //
         .with_strides({X, 1})
         .with_device<kDLCUDA>(device_)
@@ -88,11 +118,13 @@ struct StoreKernel {
         .verify(indices);
 
     const auto dtype_size = dtype_bytes(dtype_.unwrap());
+    // WHAT: this compiled variant was built for ONE row width in bytes.
     RuntimeCheck(element_size == dtype_size * D.unwrap());
 
     const auto device = device_.unwrap();
     const auto use_int32 = indices_dtype_.unwrap().bits == 32;
     const auto length = static_cast<std::size_t>(L.unwrap());
+    // WHAT: strides were measured in elements; the kernel wants bytes.
     const auto kv_cache_stride = X.unwrap() * dtype_size;
     const auto kv_input_stride = Y.unwrap() * dtype_size;
 
@@ -109,6 +141,7 @@ struct StoreKernel {
 
     constexpr auto kWarpPerBlock = num_threads / 32;
     static_assert(num_threads % 32 == 0);
+    // WHAT: one warp per word, packed 4 warps (128 threads) to a block.
     const auto num_blocks = div_ceil(length, kWarpPerBlock);
     const auto kernel = use_int32
                             ? store_kv_cache<num_threads, max_concurrency,

@@ -1,8 +1,25 @@
+# =====================================================================================
+# FILE MAP -- utils/logger.py
+# =====================================================================================
+# WHAT THIS FILE IS: the Kitchen's NOTEBOOK-WRITER. init_logger("some.module") returns a logger
+#                    that prints neat, colourful lines.
+#
+# ELI5: Every worker writes what it is doing in a notebook, in the same style:
+#           [2026-10-25|18:03:11|core|rank=0] INFO     Allocating 21000 tokens for KV cache ...
+#       With several GPU workers, all would write the same line, so there are special "_rank0"
+#       versions (info_rank0, warning_rank0 ...) that only GPU worker 0 actually writes.
+#
+# KNOBS (environment variables):  LOG_LEVEL=DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO),
+#                                 LOG_PID=1 adds the process id to every line.
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 from functools import partial
 from typing import TYPE_CHECKING
 
+# WHAT: the log level, decided once per process on the first init_logger call.
 _LOG_LEVEL = None
 
 
@@ -21,6 +38,7 @@ def init_logger(
     import sys
 
     global _LOG_LEVEL
+    # WHAT: first caller decides the level: the `level` argument, else $LOG_LEVEL, else INFO.
     if _LOG_LEVEL is None:
         LEVEL_MAP = {
             "DEBUG": logging.DEBUG,
@@ -33,6 +51,8 @@ def init_logger(
         level = level or os.getenv("LOG_LEVEL", "").upper()
         _LOG_LEVEL = LEVEL_MAP.get(level, logging.INFO)
 
+    # WHAT: `suffix` is an extra label shown in the prefix (for example "FrontendAPI").
+    #       strip_file keeps just the file-name part if a path was passed.
     if strip_file:
         suffix = os.path.basename(suffix)
 
@@ -49,6 +69,7 @@ def init_logger(
     tp_info = None
 
     # Color formatter class
+    # ELI5: decides how one log record becomes one line of text.
     class ColorFormatter(logging.Formatter):
         """Formatter with colors and pretty output"""
 
@@ -69,6 +90,7 @@ def init_logger(
             # Format timestamp like SGLang: [YYYY-MM-DD|HH:MM:SS|pid=1234]
             timestamp = self.formatTime(record, "[%Y-%m-%d|%H:%M:%S{suffix}]")
             nonlocal tp_info
+            # WHAT: once the GPU worker's rank is known, add "|core|rank=N" to the prefix.
             tp_info = tp_info or try_get_tp_info()
             if tp_info is not None and use_tp_rank is not False:
                 real_suffix = f"{suffix}|core|rank={tp_info.rank}"
@@ -100,6 +122,10 @@ def init_logger(
     # Prevent propagation to root logger
     logger.propagate = False
 
+    # ELI5: the "only worker 0 writes this" wrapper behind info_rank0 / warning_rank0 / ...
+    # GOTCHA: it needs the TP rank to be set already (Engine.__init__ does it), otherwise the
+    #         assert/get_tp_info raises. So the *_rank0 loggers are for code that runs after
+    #         engine start.
     def _call_rank0(msg, *args, _which, **kwargs):
         from minisgl.distributed import get_tp_info
 
@@ -109,6 +135,7 @@ def init_logger(
         if tp_info.is_primary():
             getattr(logger, _which)(msg, *args, **kwargs)
 
+    # WHAT: this block exists only for type checkers (so they know about the *_rank0 methods).
     if TYPE_CHECKING:
 
         class WrapperLogger(logging.Logger):
@@ -121,6 +148,7 @@ def init_logger(
 
         return WrapperLogger(name)
     else:
+        # WHAT: at run time, attach the four rank-0-only methods to the logger object.
         logger.info_rank0 = partial(_call_rank0, _which="info")
         logger.debug_rank0 = partial(_call_rank0, _which="debug")
         logger.critical_rank0 = partial(_call_rank0, _which="critical")

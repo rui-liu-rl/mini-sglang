@@ -1,3 +1,42 @@
+// =====================================================================================
+// FILE MAP -- kernel/csrc/include/minisgl/tensor.h
+// =====================================================================================
+// WHAT THIS FILE IS: `TensorMatcher`, a small declarative checker for the tensors a kernel
+//                    receives from Python: "shape [L, D], strides [Y, 1], bf16 or fp16, on a CUDA
+//                    device" in one readable chain. It also produces good error messages.
+//
+// ELI5: Every kernel wrapper begins with a bouncer at the door. Instead of a dozen if-statements,
+//       the bouncer reads like a form:
+//
+//           auto D = host::SymbolicSize{"D"};   // "some number, to be learned"
+//           auto L = host::SymbolicSize{"L"};
+//           host::TensorMatcher({L, D})         // two-dimensional
+//               .with_strides({-1, 1})          // row stride: anything; last dimension: contiguous
+//               .with_dtype<int32_t, int64_t>() // one of these dtypes
+//               .with_device<kDLCUDA>()         // on a CUDA GPU
+//               .verify(tensor);                // do the checking now
+//
+//       The trick is the SYMBOLIC values: the FIRST tensor that mentions D teaches the checker
+//       "D is 2048"; every later tensor that mentions D must then have 2048, or the check fails
+//       with "Size mismatch for D(shape#1): expected 2048 but got 1024". Dtypes and devices work
+//       the same way. After verification, `D.unwrap()` hands the learned number to the kernel.
+//
+// THE PIECES
+//       SymbolicSize     a size that is unknown until the first match, then fixed
+//       SymbolicDType    a dtype (or a set of allowed dtypes), fixed on first match
+//       SymbolicDevice   a device (or allowed device types), fixed on first match
+//       SizeRef/DTypeRef/DeviceRef   wrappers so an argument can be a literal (1024), a list of
+//                        options, or a reference to one of the symbolic objects above
+//       TensorMatcher    the chain: shape, optional strides, dtype, device, then verify
+//
+// GOTCHA: a SymbolicSize uses 0 to mean "not set yet", so a real size of 0 can never be bound
+//         (unwrap() would then say "Size value is not set"). The kernels here never pass empty
+//         tensors, so it does not matter in practice.
+//
+// WHO USES IT: jit/index.cu, jit/store.cu, src/tensor.cpp (the self-test).
+//
+// Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+// =====================================================================================
 #pragma once
 #include <minisgl/utils.h>
 
@@ -32,12 +71,17 @@ struct SizeRef;
 struct DTypeRef;
 struct DeviceRef;
 
+// WHAT: "wildcard" and "not set" markers used by the symbolic types below.
+//       kAnyDeviceID: accept any device index; kAnySize (-1): accept any size;
+//       kNullSize (0), kNullDType (code 18, not a real dtype), kNullDevice: "no value yet".
 inline constexpr auto kAnyDeviceID = -1;
 inline constexpr auto kAnySize = static_cast<int64_t>(-1);
 inline constexpr auto kNullSize = static_cast<int64_t>(0);
 inline constexpr auto kNullDType = static_cast<DLDataTypeCode>(18u);
 inline constexpr auto kNullDevice = static_cast<DLDeviceType>(-1);
 
+// WHAT: compile-time translation from a C++ type (int, float, int64_t, ...) to the DLPack dtype
+//       description (code, bits, lanes) that tensors carry. `with_dtype<int, float>()` uses it.
 template <typename T> struct dtype_trait {};
 
 template <std::integral T> struct dtype_trait<T> {
@@ -60,6 +104,8 @@ template <DLDeviceType Code> struct device_trait {
       DLDevice{.device_type = Code, .device_id = kAnyDeviceID};
 };
 
+// WHAT: the lists of allowed dtypes / device types, built at compile time from the template
+//       arguments of with_dtype<...>() and with_device<...>().
 template <typename... Ts>
 inline constexpr auto kDTypeList =
     std::array<DLDataType, sizeof...(Ts)>{dtype_trait<Ts>::value...};
@@ -73,6 +119,8 @@ template <typename T> struct PrintAbleSpan {
   std::span<const T> data;
 };
 
+// WHAT: printing helpers so error messages say "cuda[1]" or "[int32, int64]" instead of raw
+//       numbers. kDeviceStringMap is a lookup table from DLPack's device-type code to a name.
 // define DLDataType comparison and printing in root namespace
 inline constexpr auto kDeviceStringMap = [] {
   constexpr auto map =
@@ -137,6 +185,9 @@ inline auto &operator<<(std::ostream &os, PrintAbleSpan<T> span) {
 
 } // namespace details
 
+// ELI5: a number that is unknown until the first tensor tells us, then must stay the same.
+//       verify(size, ...): if already set, the new size must equal it, else it becomes the value.
+// WHAT: non-copyable on purpose (copies would silently stop sharing the learned value).
 struct SymbolicSize {
 public:
   SymbolicSize(std::string_view annotation = {})
@@ -199,6 +250,8 @@ inline auto operator==(DLDevice lhs, DLDevice rhs) -> bool {
   return lhs.device_type == rhs.device_type && lhs.device_id == rhs.device_id;
 }
 
+// ELI5: the same idea for data types, plus an optional list of allowed ones
+//       (set_options). The first tensor must be one of the allowed; later tensors must match it.
 struct SymbolicDType {
 public:
   SymbolicDType() : m_value({details::kNullDType, 0, 0}) {}
@@ -245,6 +298,9 @@ private:
   DLDataType m_value;
 };
 
+// ELI5: the same idea for devices. An allowed option may leave the device index as a wildcard
+//       (kAnyDeviceID): "any CUDA GPU"; once the first tensor is seen, later tensors must be on
+//       exactly the same device.
 struct SymbolicDevice {
 public:
   SymbolicDevice() : m_value({details::kNullDevice, details::kAnyDeviceID}) {}
@@ -305,6 +361,9 @@ struct TensorMatcher;
 
 namespace details {
 
+// ELI5: a pointer-like wrapper that either points at a symbolic object the caller owns (so several
+//       tensors share it) or at a private one it creates for itself. SizeRef/DTypeRef/DeviceRef
+//       below add the convenient constructors, so `{L, 1024}` or `{kDLInt, 32, 1}` just work.
 template <typename T> struct BaseRef {
 public:
   BaseRef(const BaseRef &) = delete;
@@ -357,6 +416,14 @@ struct DeviceRef : BaseRef<SymbolicDevice> {
 
 } // namespace details
 
+// ELI5: the checklist. Build it by chaining (shape in the constructor; then optionally
+//       .with_strides, .with_dtype, .with_device), then call .verify(tensor) one or more times.
+//       The chaining methods are `&&`-qualified: they can only be called on a temporary, which
+//       enforces "write the whole chain in one expression".
+// ABOUT STRIDES: if no strides are given, the tensor must be contiguous. A stride of -1 means
+//       "any". A dimension of size 1 skips its stride check (its stride is meaningless).
+// WHAT verify DOES ON FAILURE: it catches the low-level error and rethrows it with the full
+//       description of what was expected (debug_str) and the file and line of the verify call.
 struct TensorMatcher {
 private:
   using SizeRef = details::SizeRef;
@@ -452,6 +519,8 @@ public:
   }
 
 private:
+  // WHAT: the actual checks, in order: number of dimensions; each size against its symbol or
+  //       literal; strides (or contiguity if none were given); dtype; device.
   auto m_verify_impl(tvm::ffi::TensorView view) const -> void {
     const auto dim = static_cast<std::size_t>(view.dim());
     RuntimeCheck(dim == m_shape.size(), "Tensor dimension mismatch: expected ",

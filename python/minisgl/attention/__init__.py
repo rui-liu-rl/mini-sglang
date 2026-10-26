@@ -1,3 +1,19 @@
+# =====================================================================================
+# FILE MAP -- attention/__init__.py
+# =====================================================================================
+# WHAT THIS FILE IS: the attention "toolbox label": it registers the available backends by name
+#                    and builds the right one (or a prefill/decode HYBRID of two).
+#
+# NAMES -> BACKENDS:   "fi" -> FlashInfer     "fa" -> FlashAttention (sgl_kernel)
+#                      "trtllm" -> TensorRT-LLM kernels
+# A HYBRID is written "prefillName,decodeName", e.g. "fa,fi" (what the "auto" choice gives on
+# Hopper GPUs). If both halves are the same name, it logs a warning and uses a single backend.
+#
+# This uses the Registry pattern (utils/registry.py): each backend is registered with a decorator
+# and created lazily (the import of the heavy library happens inside the factory function).
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
@@ -12,6 +28,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# WHAT: a type description: "a function taking a ModelConfig and returning a backend".
 class BackendCreator(Protocol):
     def __call__(self, config: ModelConfig) -> BaseAttnBackend: ...
 
@@ -40,6 +57,8 @@ def create_fa_backend(config: ModelConfig):
     return FlashAttentionBackend(config)
 
 
+# WHAT: used as the argparse `type=` for --attention-backend: checks every comma-separated name is
+#       registered (or is "auto" where allowed) and returns the original string.
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]
@@ -49,6 +68,9 @@ def validate_attn_backend(backend: str, allow_auto: bool = True):
     return backend
 
 
+# ELI5: "Build the attention tool(s) the user asked for."
+# WHAT: "name" -> that backend. "a,b" with a != b -> HybridBackend(prefill=a, decode=b).
+#       "a,a" -> single backend a (with a warning).
 def create_attention_backend(
     backend: str,
     config: ModelConfig,

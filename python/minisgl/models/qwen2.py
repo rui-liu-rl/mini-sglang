@@ -1,3 +1,10 @@
+# FILE MAP -- models/qwen2.py
+# WHAT: the Qwen2 / Qwen2.5 recipe. Identical building blocks to qwen3.py (read that file's
+#       comments first); the ONLY differences are in the attention flags:
+#           has_qk_norm=False     (no per-head normalisation of Q and K, unlike Qwen3)
+#           has_attn_bias=True    (the Q/K/V projection has a bias term; Qwen2 checkpoints include it)
+# ELI5: same building, different furniture in the meeting room.
+# Tag legend: see zero-to-sglang/eli5/README.md
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
@@ -15,6 +22,7 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 
+# ELI5: ONE FLOOR (same five lines as Qwen3's).
 class Qwen2DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self.self_attn = Qwen2Attn(config, layer_id, has_qk_norm=False, has_attn_bias=True)
@@ -41,6 +49,7 @@ class Qwen2DecoderLayer(BaseOP):
         return x, residual
 
 
+# ELI5: THE BUILDING (embed -> floors -> final norm).
 class Qwen2Model(BaseOP):
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(
@@ -63,6 +72,7 @@ class Qwen2Model(BaseOP):
         return self.norm.forward(x, residual)[0]
 
 
+# ELI5: THE BUILDING WITH THE SCOREBOARD ON TOP.
 class Qwen2ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen2Model(config)

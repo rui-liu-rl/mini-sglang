@@ -1,3 +1,13 @@
+# FILE MAP -- models/qwen3_moe.py
+# WHAT: the Qwen3 Mixture-of-Experts recipe. Same floors as qwen3.py except the private office:
+#       `self.mlp` is MoEMLP (a router + many expert MLPs, see models/utils.py and layers/moe.py)
+#       instead of the single GatedMLP. Attention is exactly Qwen3's (has_qk_norm=True).
+# ELI5: same building, but each floor's private office is replaced by a hall of many small
+#       offices with a receptionist who sends each word to a few of them.
+# NAMING NOTE: the local aliases are called Qwen3MLP / Qwen3Attn / Qwen3DecoderLayer / Qwen3Model
+#       (copied from qwen3.py); only the top class is named Qwen3MoeForCausalLM, to match the HF
+#       architecture name in models/register.py.
+# Tag legend: see zero-to-sglang/eli5/README.md
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
@@ -15,6 +25,7 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 
+# ELI5: ONE FLOOR (same five lines as Qwen3's; only `mlp` differs in its type).
 class Qwen3DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
         self.self_attn = Qwen3Attn(config, layer_id, has_qk_norm=True)
@@ -41,6 +52,7 @@ class Qwen3DecoderLayer(BaseOP):
         return x, residual
 
 
+# ELI5: THE BUILDING (embed -> floors -> final norm).
 class Qwen3Model(BaseOP):
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(
@@ -63,6 +75,7 @@ class Qwen3Model(BaseOP):
         return self.norm.forward(x, residual)[0]
 
 
+# ELI5: THE BUILDING WITH THE SCOREBOARD ON TOP.
 class Qwen3MoeForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3Model(config)

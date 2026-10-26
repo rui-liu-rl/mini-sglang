@@ -1,3 +1,33 @@
+# =====================================================================================
+# FILE MAP -- tests/core/test_cache_allocate.py   (a real pytest file; runs on CPU, no GPU needed)
+# =====================================================================================
+# WHAT THIS FILE TESTS: the pantry clerk (scheduler/cache.py, CacheManager) when it has to EVICT
+#                       old notes from the radix tree to make room, with page_size > 1.
+#
+# ELI5: With bigger pages the clerk's free list holds the FIRST slot of each page: for page size 4,
+#       [0, 4, 8, 12]. When the shelf is full and she throws old notes out of the shared index to
+#       get pages back, the slot numbers that come back must STILL be page starts (multiples of the
+#       page size), must not overlap, and must expand into consecutive slots. If they were off by
+#       even one slot, two orders would share half a page and silently corrupt each other's notes.
+#
+# THE SETUP TRICK (every test): fill the whole shelf (_allocate all pages), then insert a prefix
+#       into the radix tree so its pages are "evictable", then ask for pages again: the clerk has
+#       to evict. `insert_prefix(ids, indices)` just files the numbers; nothing runs on a GPU.
+#       The page_table argument is a dummy tensor: these tests never read it.
+#
+# WHAT EACH TEST CHECKS
+#   test_allocate_after_evict_returns_page_aligned        returned pages and the free list are multiples of page_size
+#   test_consecutive_allocations_after_evict_no_overlap   two single-page allocations never share a slot
+#   test_free_slots_stay_page_aligned_after_evict         free list still aligned after a refill (page size 8)
+#   test_allocate_exact_pages_needed_from_evict           asking for 2 pages gets exactly 2, aligned, non-overlapping
+#   test_page_to_token_expansion_correct_after_evict      _page_to_token turns each page start into page_size consecutive slots
+#   test_check_integrity_passes_after_evict_cycle         check_integrity passes with 6 free + 2 cached = 8 pages;
+#                                                         then a forced eviction still returns aligned pages
+#
+# Run: pytest tests/core/test_cache_allocate.py
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 """
 Test that CacheManager._allocate correctly handles eviction with page_size > 1.
 """

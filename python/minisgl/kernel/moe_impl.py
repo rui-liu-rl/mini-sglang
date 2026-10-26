@@ -1,8 +1,39 @@
+# =====================================================================================
+# FILE MAP -- kernel/moe_impl.py
+# =====================================================================================
+# WHAT THIS FILE IS: the Python launchers for the two Triton GPU kernels used by Mixture-of-Experts
+#                    layers: the "grouped" matrix multiply (fused_moe_kernel_triton) and the
+#                    final sum over each token's chosen experts (moe_sum_reduce_triton).
+#                    The GPU programs themselves are in kernel/triton/fused_moe.py.
+#
+# ELI5 (MoE in one paragraph): a Mixture-of-Experts model has many small MLPs ("experts") per layer
+#       (e.g. 128). For each word, a tiny router picks the best few (top-k, e.g. 8). Only those
+#       experts process the word, and their answers are added up with the router's weights.
+#       So the work is "many different small matrix multiplies, each for a different subset of
+#       words". These launchers set up that irregular work for the GPU: how many blocks, what
+#       strides, which settings. The heavy lifting is the Triton code.
+#
+# WHO CALLS IT: moe/fused.py (fused_experts_impl).
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from typing import Any, Dict
 
 import torch
 
 
+# ELI5: "For every (word, chosen expert) pair, multiply the word's vector by that expert's weight
+#       matrix, optionally scaling by the router weight."
+# SHAPE: A [rows, K]        input vectors (hidden states, or the activated intermediate)
+#        B [E, N, K]        one weight matrix per expert (E experts; N outputs; K inputs)
+#        C [M, top_k, N]    output (one row per (word, expert) pair)
+#        sorted_token_ids   word-slots sorted by expert, padded so each expert's group is a multiple
+#                           of BLOCK_SIZE_M (see moe_align_block_size in moe/fused.py)
+#        expert_ids         one expert id per BLOCK of BLOCK_SIZE_M sorted slots
+#        num_tokens_post_padded  [1] how many sorted slots (including padding) are real work
+# WHAT: the launch "grid" has one program per (block of rows) x (block of output columns):
+#       cdiv(len(sorted_token_ids), BLOCK_SIZE_M) x cdiv(N, BLOCK_SIZE_N) programs, flattened to 1-D.
+#       even_Ks tells the kernel whether K is an exact multiple of BLOCK_SIZE_K so it can skip masking.
 def fused_moe_kernel_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -22,9 +53,11 @@ def fused_moe_kernel_triton(
 
     from .triton.fused_moe import fused_moe_kernel
 
+    # WHAT: layout requirements of the kernel (rows of topk_weights contiguous; the sorted id list contiguous).
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
     padded_size = 0
+    # WHAT: Triton calls this function with the chosen meta-parameters to size the grid.
     grid = lambda META: (
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -35,6 +68,10 @@ def fused_moe_kernel_triton(
     else:
         even_Ks = False
     dtype = tl.bfloat16 if compute_type == torch.bfloat16 else tl.float16
+    # WHAT: launch. Arguments, in order: the pointers; N (outputs per expert), K (inputs), EM (number of
+    #       sorted slots incl. padding), number of valid (word, expert) pairs; then the strides of A,
+    #       B (expert, K, N) and C; then the compile-time settings.
+    #       Note B's strides are passed as (stride(0), stride(2), stride(1)) = (expert, K, N).
     fused_moe_kernel[grid](
         A,
         B,
@@ -62,6 +99,11 @@ def fused_moe_kernel_triton(
     )
 
 
+# ELI5: "Each word got top_k expert answers; add them up into one vector per word."
+# SHAPE: input [tokens, top_k, hidden] (contiguous) -> output [tokens, hidden] (contiguous).
+# WHAT: the grid has one program per (BLOCK_M = 1 token) x (a chunk of BLOCK_DIM = 2048 columns).
+#       Each program loops over the top_k answers, adding them in float32, then stores in the
+#       input dtype. 8 warps (256 threads) per program.
 def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
     import triton
 

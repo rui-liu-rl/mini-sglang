@@ -1,3 +1,28 @@
+# =====================================================================================
+# FILE MAP -- benchmark/online/bench_qwen.py
+# =====================================================================================
+# WHAT THIS FILE IS: an ONLINE benchmark that replays a recorded real-world request trace against
+#                    a RUNNING mini-sglang server (start it first: python -m minisgl --model ...,
+#                    port 1919), at several request rates, and prints TTFT / TPOT / throughput.
+#
+# ELI5: "Replay yesterday's traffic, then play it faster and faster, and see when the kitchen
+#       starts to struggle." The trace is a public file of real requests from an Alibaba service
+#       (one JSON line per request: time sent, prompt length, output length).
+#
+# STEPS
+#   1. connect to the server through the OpenAI-style client; ask it which model it serves
+#   2. download the trace file once (next to this script) and read the first N = 1000 lines
+#      (dummy=True: prompts are cut from one long random prompt, so they SHARE prefixes, which
+#       lets a prefix cache show its worth)
+#   3. for each SCALE in [0.4, 0.5, 0.6, 0.7, 0.8, 1.6]: multiply all send-times by SCALE
+#      (smaller = requests come faster) and replay; print the statistics after each pass
+#
+# READING THE RESULTS: as the scale gets smaller the arrival rate rises. Watch TTFT: when the
+#       server cannot keep up, requests queue and TTFT climbs sharply (the "knee" of the curve).
+#       (Statistics are produced by benchmark/client.py: process_benchmark_results.)
+#
+# Tag legend (ELI5 / WHAT / WHY / SHAPE / GOTCHA): see zero-to-sglang/eli5/README.md
+# =====================================================================================
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +46,7 @@ logger = init_logger(__name__)
 URL = "https://media.githubusercontent.com/media/alibaba-edu/qwen-bailian-usagetraces-anon/refs/heads/main/qwen_traceA_blksz_16.jsonl"
 
 
+# WHAT: download the trace to the folder of this script the first time; reuse it afterwards.
 def download_qwen_trace(url: str) -> str:
     dir = Path(os.path.dirname(__file__))
     # download the file if not exists
